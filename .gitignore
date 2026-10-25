@@ -1,0 +1,7 @@
+# Logs and backups contain your Wi-Fi name and connection history: keep them local
+*.csv
+*.bak
+
+# Private environment created by start.command
+.venv/
+__pycache__/
