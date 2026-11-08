@@ -661,6 +661,11 @@ def conn_lines(a):
     return lines
 
 
+def link_kind(o):
+    """What kind of link a drop happened on: 'wifi', 'ethernet', or 'none' (no link, unknown...)."""
+    return 'wifi' if o['raw'].endswith('-wifi') else 'ethernet' if o['raw'].endswith('-ethernet') else 'none'
+
+
 def where(o):
     """Short description of the connection a drop happened on."""
     modem = ' (modem)' if o['modem'] else ''
@@ -943,7 +948,13 @@ class Dashboard:
         if 'UPSTREAM' in causes:
             by_cause.append([('upstream', WARN), ("  router answered, the internet didn't → modem or provider", DIM)])
         if 'LOCAL' in causes:
-            by_cause.append([('local', BAD), ("  router didn't answer → Wi-Fi, cable or router", DIM)])
+            # Name only the links the local drops on screen actually happened on.
+            kinds = {link_kind(o) for o in rows if o['cause'] == 'LOCAL'}
+            blame = {frozenset({'wifi'}): "Wi-Fi signal or the router",
+                     frozenset({'ethernet'}): "cable or the router",
+                     frozenset({'none'}): "this computer had no network connection"}.get(
+                frozenset(kinds), "Wi-Fi, cable or the router")
+            by_cause.append([('local', BAD), (f"  router didn't answer → {blame}", DIM)])
         if 'unknown' in causes:
             by_cause.append([('unknown', DIM), ('  router status not known', DIM)])
         if by_cause:
