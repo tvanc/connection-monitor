@@ -360,13 +360,18 @@ def label(conn, network):
 
 
 def tab_key(conn, network):
-    """The dashboard tab a connection belongs to: 'ethernet', the Wi-Fi network's name ('Wi-Fi (unknown)' if it
-    couldn't be read), or 'other' for everything else (no link, unknown, VPN...)."""
+    """The dashboard tab a connection belongs to: 'ethernet', the Wi-Fi network's name, or 'other' for everything
+    else (no link, VPN, Wi-Fi whose network name couldn't be read...)."""
     if conn.endswith('-ethernet'):
         return 'ethernet'
-    if conn.endswith('-wifi'):
-        return network if network and network != 'unknown' else 'Wi-Fi (unknown)'
+    if conn.endswith('-wifi') and network and network != 'unknown':
+        return network
     return 'other'
+
+
+def tab_title(key):
+    """How a tab is written on screen."""
+    return 'Other' if key == 'other' else key
 
 
 # ---------------------------------------------------------------- keep the computer awake
@@ -495,12 +500,12 @@ def build_report(args, since, recent=15):
     add(f'Downtime:      {format_span(a.down_s)}')
     if a.lat:
         add(f'Latency:       avg {sum(a.lat) / len(a.lat):.0f} ms, max {max(a.lat):.0f} ms')
-    width = max([17] + [len(n) + 2 for n in by_conn])
+    width = max([17] + [len(tab_title(n)) + 2 for n in by_conn])
     for name in sorted(by_conn):
         t = by_conn[name]['up'] + by_conn[name]['down']
         n = sum(1 for o in outages if o['tab'] == name)
         p = 100 * by_conn[name]['up'] / t if t > 0 else 0
-        add(f'{name + ":":<{width}}{p:6.2f}% up over {format_span(t)}, {n} drop{"" if n == 1 else "s"}')
+        add(f'{tab_title(name) + ":":<{width}}{p:6.2f}% up over {format_span(t)}, {n} drop{"" if n == 1 else "s"}')
 
     add()
     add(f'Drops:         {len(outages)}', 'red' if outages else 'green')
@@ -608,13 +613,13 @@ CAUSE_COLOUR = {'UPSTREAM': WARN, 'LOCAL': BAD, 'unknown': DIM}
 def scope_view(a, key):
     """The numbers for the whole log (key None) or for one tab/connection."""
     if key is None:
-        return SimpleNamespace(name='all connections', pct=a.pct, down_s=a.down_s, outages=a.outages, lat=a.lat,
+        return SimpleNamespace(name='All connections', pct=a.pct, down_s=a.down_s, outages=a.outages, lat=a.lat,
                                monitored=a.monitored, first=a.rows[0]['t'], last=a.rows[-1]['t'])
     c = a.by_tab.get(key, {'up': 0.0, 'down': 0.0})
     total = c['up'] + c['down']
     rows = [r for r in a.rows if r['tab'] == key and not r['stop']]
     return SimpleNamespace(
-        name=key, pct=100 * c['up'] / total if total > 0 else 0, down_s=c['down'],
+        name=tab_title(key), pct=100 * c['up'] / total if total > 0 else 0, down_s=c['down'],
         outages=[o for o in a.outages if o['tab'] == key], monitored=total,
         lat=[float(r['ms']) for r in rows if r['up'] and r['ms'] != ''],
         first=rows[0]['t'] if rows else a.rows[0]['t'], last=rows[-1]['t'] if rows else a.rows[-1]['t'])
@@ -643,7 +648,7 @@ def stat_cards(v):
 
 def conn_lines(a):
     """One line per connection/network with its share of the time and drop count."""
-    width = max(len(n) for n in a.by_tab)
+    width = max(len(tab_title(n)) for n in a.by_tab)
     lines = []
     for name in sorted(a.by_tab, key=lambda k: -(a.by_tab[k]['up'] + a.by_tab[k]['down'])):
         c = a.by_tab[name]
@@ -651,16 +656,17 @@ def conn_lines(a):
         p = 100 * c['up'] / t if t > 0 else 0
         n = sum(1 for o in a.outages if o['tab'] == name)
         lines.append(Text.assemble(
-            (f'  {name:<{width}}  ', 'bold'), (f'{p:6.2f}% up', OK if p >= 99.9 else WARN if p >= 99 else BAD),
+            (f'  {tab_title(name):<{width}}  ', 'bold'), (f'{p:6.2f}% up', OK if p >= 99.9 else WARN if p >= 99 else BAD),
             (f' · {format_span(t)} · {n} drop{"" if n == 1 else "s"}', DIM), no_wrap=True, overflow='ellipsis'))
     return lines
 
 
 def where(o):
     """Short description of the connection a drop happened on."""
-    if o['tab'] == 'other':
-        return o['raw']  # e.g. no-link, which the tab name alone would hide
-    return o['tab'] + (' (modem)' if o['modem'] else '')
+    modem = ' (modem)' if o['modem'] else ''
+    if o['tab'] == 'other':  # the tab name says nothing here, so say what it was
+        return ('Wi-Fi, network name unknown' + modem) if o['raw'].endswith('-wifi') else o['raw']  # e.g. no-link
+    return o['tab'] + modem
 
 
 def drop_line(o, show_conn=True, selected=False):
@@ -834,7 +840,7 @@ class InputWatcher:
 
 
 def tab_order(key):
-    rank = {'ethernet': 0, 'Wi-Fi (unknown)': 8, 'other': 9}.get(key, 1)
+    rank = {'ethernet': 0, 'other': 9}.get(key, 1)
     return rank, key.lower()
 
 
@@ -902,10 +908,11 @@ class Dashboard:
             hits.append((x0, text.cell_len, key))
             text.append(' ')
 
-        item(None, 'all', 'grey85', len(a.outages))
-        if len(a.by_tab) > 1:  # with a single connection a tab would just repeat "all"
+        item(None, 'All', 'grey85', len(a.outages))
+        if len(a.by_tab) > 1:  # with a single connection a tab would just repeat "All"
             for key in sorted(a.by_tab, key=tab_order):
-                item(key, key, DIM if key == 'other' else ACCENT, sum(1 for o in a.outages if o['tab'] == key))
+                item(key, tab_title(key), DIM if key == 'other' else ACCENT,
+                     sum(1 for o in a.outages if o['tab'] == key))
             text.append('◂ click one to filter', style=DIM)
         self.tab_hits = hits
         return text
@@ -930,7 +937,6 @@ class Dashboard:
         causes = {o['cause'] for o in rows}
         net_down = not all(m.hist_net[-n:])
         router_down = bool(m.router_ip) and not all(m.hist_router[-n:])
-        tabs = set(a.by_tab) if len(a.by_tab) > 1 else set()
         lines = []
 
         by_cause = []
@@ -958,13 +964,8 @@ class Dashboard:
             entries += [('      click a red/yellow ■ above to jump to that drop', DIM)]
             lines.append(entries)
 
-        notes = []
         if any(o['modem'] for o in rows):
-            notes.append('(modem) = plugged straight into a modem rather than a router (guessed from the IP)')
-        if 'Wi-Fi (unknown)' in tabs:
-            notes.append("Wi-Fi (unknown) = the network's name couldn't be read")
-        if notes:
-            lines.append([(' ' + ' · '.join(notes), DIM)])
+            lines.append([(' (modem) = plugged straight into a modem rather than a router (guessed from the IP)', DIM)])
         return [Text.assemble(*e, no_wrap=True, overflow='ellipsis') for e in lines]
 
     def __rich_console__(self, console, options):
