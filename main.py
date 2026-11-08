@@ -23,6 +23,11 @@ crash/power loss, seen as a missing heartbeat) and the next start is reported
 as "not monitored" instead of counting as up or down. If you change --heartbeat,
 pass the same value to --report.
 
+Self-update: when run from a plain copy of the files (not a git checkout), it checks GitHub on start-up and,
+if there's a newer commit, replaces main.py (and start.command / start.bat if present) and restarts. A git
+checkout (a .git folder next to the script) is never touched, so local development isn't disturbed. Skip the
+check with --no-update or by setting CONNECTION_MONITOR_NO_UPDATE=1.
+
 Works on macOS (primary target), Linux and Windows. Standard library only, except that the full-screen
 dashboard and the pretty report use the 'rich' package when it's installed (pip3 install rich); without
 it, or with --plain, everything falls back to simple text output.
@@ -35,6 +40,7 @@ q (or Ctrl+C) stops.
 import argparse
 import csv
 import ipaddress
+import json
 import os
 import platform
 import re
@@ -44,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1215,6 +1222,67 @@ class Monitor:
                 append_row(a.log_file, [f'{datetime.now():{TS_FORMAT}}', 'STOP', '', '', '', ''])
 
 
+# ---------------------------------------------------------------- self-update
+
+UPDATE_REPO = 'tvanc/connection-monitor'
+UPDATE_BRANCH = 'main'
+UPDATE_FILES = ('main.py', 'start.command', 'start.bat')  # replaced only if they already exist next to the script
+
+
+def http_get(url, timeout=4):
+    req = urllib.request.Request(url, headers={'User-Agent': 'connection-monitor-updater',
+                                               'Accept': 'application/vnd.github.sha'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def latest_commit():
+    """SHA of the newest commit on the update branch, or None."""
+    url = os.environ.get('CM_UPDATE_API') or f'https://api.github.com/repos/{UPDATE_REPO}/commits/{UPDATE_BRANCH}'
+    text = http_get(url).decode().strip()
+    if text.startswith('{'):
+        text = json.loads(text).get('sha', '')
+    return text if re.fullmatch(r'[0-9a-f]{40}', text) else None
+
+
+def self_update(args):
+    """Install the newest version from GitHub and restart, if this is a plain copy and GitHub is ahead.
+    Silent on any failure (offline, rate limited...): the version you have keeps working."""
+    if args.no_update or os.environ.get('CONNECTION_MONITOR_NO_UPDATE') or os.environ.get('CM_JUST_UPDATED'):
+        return
+    here = Path(__file__).resolve().parent
+    if (here / '.git').exists():
+        return  # a development checkout: never overwrite it
+    try:
+        sha = latest_commit()
+        marker = here / '.version'  # the commit this copy was last brought up to date with
+        if not sha or (marker.exists() and marker.read_text().strip() == sha):
+            return
+        raw = os.environ.get('CM_UPDATE_RAW') or f'https://raw.githubusercontent.com/{UPDATE_REPO}'
+        new = {name: http_get(f'{raw}/{sha}/{name}') for name in UPDATE_FILES
+               if name == 'main.py' or (here / name).exists()}
+        compile(new['main.py'], 'main.py', 'exec')  # refuse to install something that doesn't even compile
+        same = lambda a, b: a.replace(b'\r\n', b'\n') == b.replace(b'\r\n', b'\n')  # ignore line-ending differences
+        changed = [n for n, data in new.items() if not (here / n).exists() or not same((here / n).read_bytes(), data)]
+        for name in changed:
+            target = here / name
+            tmp = target.with_name(target.name + '.new')
+            tmp.write_bytes(new[name])
+            if target.exists():
+                shutil.copymode(target, tmp)  # keeps start.command executable
+                if name == 'main.py':
+                    shutil.copy2(target, target.with_name('main.py.previous'))  # one step back, just in case
+            os.replace(tmp, target)  # replacing (not editing) is safe even while a shell is running start.command
+        marker.write_text(sha + '\n')
+        if changed:
+            print(f'Updated to the latest version ({sha[:7]}); restarting...')
+            os.environ['CM_JUST_UPDATED'] = '1'
+            sys.stdout.flush()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception:
+        pass
+
+
 def main():
     p = argparse.ArgumentParser(description='Monitor internet connectivity and report uptime and drops.')
     p.add_argument('--report', action='store_true', help='show stats from the log and exit')
@@ -1235,10 +1303,13 @@ def main():
     p.add_argument('--quiet', action='store_true', help='no live dashboard, just print up/down events')
     p.add_argument('--wifi-shortcut', default=SHORTCUT_NAME, metavar='NAME',
                    help='macOS only: name of a Shortcut that returns the Wi-Fi network name (default "%(default)s")')
+    p.add_argument('--no-update', action='store_true',
+                   help="don't check GitHub for a newer version on start-up")
     p.add_argument('--plain', action='store_true', help="simple text output even if 'rich' is installed")
     p.add_argument('--count', type=int, default=0, help='stop after N checks (0 = run forever)')
     args = p.parse_args()
     globals()['SHORTCUT_NAME'] = args.wifi_shortcut
+    self_update(args)
 
     if os.name == 'nt':
         os.system('')  # enables ANSI escape codes in the Windows console

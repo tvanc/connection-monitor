@@ -5,3 +5,8 @@
 # Private environment created by start.command
 .venv/
 __pycache__/
+
+# Written by the self-updater in plain (non-git) copies
+.version
+main.py.previous
+*.new
