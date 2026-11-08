@@ -27,8 +27,10 @@ Works on macOS (primary target), Linux and Windows. Standard library only, excep
 dashboard and the pretty report use the 'rich' package when it's installed (pip3 install rich); without
 it, or with --plain, everything falls back to simple text output.
 
-Dashboard keys: mouse wheel / arrow keys / PgUp / PgDn scroll the drops list, End follows the newest,
-click a tab to filter the list, q (or Ctrl+C) stops.
+Dashboard: click a tab (a connection such as router-ethernet or router-wifi [Home]) and both the stats
+and the drops list follow it. Click a red/yellow square in the timelines to jump to that drop. Mouse
+wheel / arrow keys / PgUp / PgDn scroll the list, End follows the newest, ? shows/hides the legend,
+q (or Ctrl+C) stops.
 """
 import argparse
 import csv
@@ -350,6 +352,16 @@ def label(conn, network):
     return f'{conn} [{network}]' if network else conn
 
 
+def tab_key(conn, network):
+    """The dashboard tab a connection belongs to: 'ethernet', the Wi-Fi network's name ('Wi-Fi (unknown)' if it
+    couldn't be read), or 'other' for everything else (no link, unknown, VPN...)."""
+    if conn.endswith('-ethernet'):
+        return 'ethernet'
+    if conn.endswith('-wifi'):
+        return network if network and network != 'unknown' else 'Wi-Fi (unknown)'
+    return 'other'
+
+
 # ---------------------------------------------------------------- keep the computer awake
 
 def keep_awake():
@@ -389,6 +401,7 @@ def load_rows(path, since):
             # rows logged before the Network column existed: Wi-Fi network unknown
             rows[-1]['network'] = r.get('Network') or ('unknown' if rows[-1]['conn'].endswith('wifi') else '')
             rows[-1]['label'] = label(rows[-1]['conn'], rows[-1]['network'])
+            rows[-1]['tab'] = tab_key(rows[-1]['conn'], rows[-1]['network'])
     rows = [r for r in rows if r['t'] >= since]
     rows.sort(key=lambda r: r['t'])
     return rows
@@ -409,8 +422,8 @@ def analyze(args, since):
         return None, 'Not enough data yet.'
 
     up_s = down_s = unmonitored = 0.0
-    outages, by_conn = [], {}
-    start = start_label = start_net = None
+    outages, by_conn, by_tab = [], {}, {}
+    start = start_label = start_net = start_tab = start_raw = None
     router_down = router_known = 0.0
 
     for i, r in enumerate(rows):
@@ -427,14 +440,17 @@ def analyze(args, since):
                 unmonitored += dt
                 dt = 0
             c = by_conn.setdefault(r['label'], {'up': 0.0, 'down': 0.0})
+            tb = by_tab.setdefault(r['tab'], {'up': 0.0, 'down': 0.0})
             if r['up']:
                 up_s += dt
                 c['up'] += dt
+                tb['up'] += dt
             else:
                 down_s += dt
                 c['down'] += dt
+                tb['down'] += dt
                 if start is None:
-                    start, start_label, start_net = r['t'], r['label'], r['network']
+                    start, start_label, start_net, start_tab, start_raw = r['t'], r['label'], r['network'], r['tab'], r['conn']
                     router_down, router_known = 0.0, 0.0
                 if r['router']:
                     router_known += weight
@@ -443,13 +459,14 @@ def analyze(args, since):
         if start is not None and (r['stop'] or r['up'] or gap or nxt is None):
             cause = 'unknown' if not router_known else ('LOCAL' if router_down * 2 > router_known else 'UPSTREAM')
             outages.append({'start': start, 'end': r['t'], 'secs': (r['t'] - start).total_seconds(),
-                            'conn': start_label, 'network': start_net, 'cause': cause,
+                            'conn': start_label, 'network': start_net, 'tab': start_tab, 'raw': start_raw,
+                            'modem': start_raw.startswith('modem'), 'cause': cause,
                             'ongoing': not r['up'] and not r['stop'] and not gap and nxt is None})
             start = None
 
     monitored = up_s + down_s
     return SimpleNamespace(
-        rows=rows, outages=outages, by_conn=by_conn, up_s=up_s, down_s=down_s, unmonitored=unmonitored,
+        rows=rows, outages=outages, by_conn=by_conn, by_tab=by_tab, up_s=up_s, down_s=down_s, unmonitored=unmonitored,
         monitored=monitored, pct=100 * up_s / monitored if monitored > 0 else 0,
         span_days=max((rows[-1]['t'] - rows[0]['t']).total_seconds() / 86400 - unmonitored / 86400, 1 / 86400),
         lat=[float(r['ms']) for r in rows if r['up'] and r['ms'] != '']), None
@@ -462,7 +479,7 @@ def build_report(args, since, recent=15):
         return [(msg, None)]
     out = []
     add = lambda text='', col=None: out.append((text, col))
-    rows, outages, by_conn = a.rows, a.outages, a.by_conn
+    rows, outages, by_conn = a.rows, a.outages, a.by_tab
     add()
     add('=== Internet connection report ===', 'cyan')
     add(f"Period:        {rows[0]['t']:%m/%d/%Y %I:%M %p}  ->  {rows[-1]['t']:%m/%d/%Y %I:%M %p}")
@@ -474,7 +491,7 @@ def build_report(args, since, recent=15):
     width = max([17] + [len(n) + 2 for n in by_conn])
     for name in sorted(by_conn):
         t = by_conn[name]['up'] + by_conn[name]['down']
-        n = sum(1 for o in outages if o['conn'] == name)
+        n = sum(1 for o in outages if o['tab'] == name)
         p = 100 * by_conn[name]['up'] / t if t > 0 else 0
         add(f'{name + ":":<{width}}{p:6.2f}% up over {format_span(t)}, {n} drop{"" if n == 1 else "s"}')
 
@@ -496,7 +513,7 @@ def build_report(args, since, recent=15):
         add()
         add('Most recent drops:')
         for o in outages[-recent:]:
-            add(f"  {o['start']:%Y-%m-%d %H:%M:%S}  lasted {format_span(o['secs']):<8} [{o['cause']}] {o['conn']}"
+            add(f"  {o['start']:%Y-%m-%d %H:%M:%S}  lasted {format_span(o['secs']):<8} [{o['cause']}] {where(o)}"
                 f"{'  (ongoing)' if o['ongoing'] else ''}")
     add()
     return out
@@ -581,50 +598,75 @@ def compact(args):
 CAUSE_COLOUR = {'UPSTREAM': WARN, 'LOCAL': BAD, 'unknown': DIM}
 
 
-def stat_cards(a):
+def scope_view(a, key):
+    """The numbers for the whole log (key None) or for one tab/connection."""
+    if key is None:
+        return SimpleNamespace(name='all connections', pct=a.pct, down_s=a.down_s, outages=a.outages, lat=a.lat,
+                               monitored=a.monitored, first=a.rows[0]['t'], last=a.rows[-1]['t'])
+    c = a.by_tab.get(key, {'up': 0.0, 'down': 0.0})
+    total = c['up'] + c['down']
+    rows = [r for r in a.rows if r['tab'] == key and not r['stop']]
+    return SimpleNamespace(
+        name=key, pct=100 * c['up'] / total if total > 0 else 0, down_s=c['down'],
+        outages=[o for o in a.outages if o['tab'] == key], monitored=total,
+        lat=[float(r['ms']) for r in rows if r['up'] and r['ms'] != ''],
+        first=rows[0]['t'] if rows else a.rows[0]['t'], last=rows[-1]['t'] if rows else a.rows[-1]['t'])
+
+
+def stat_cards(v):
     """Panel of big numbers over dim labels: uptime, downtime, drops, average drop, latency."""
-    colour = OK if a.pct >= 99.9 else WARN if a.pct >= 99 else BAD
-    n = len(a.outages)
-    avg = sum(o['secs'] for o in a.outages) / n if n else None
+    colour = OK if v.pct >= 99.9 else WARN if v.pct >= 99 else BAD
+    n = len(v.outages)
+    avg = sum(o['secs'] for o in v.outages) / n if n else None
     t = Table.grid(padding=(0, 2), expand=True)
     for _ in range(5):
         t.add_column(justify='center', ratio=1)
     t.add_row(
-        Text.assemble((f'{a.pct:.3f}%', f'bold {colour}'), ('\nuptime', DIM)),
-        Text.assemble((format_span(a.down_s), f'bold {BAD}' if a.down_s else 'bold'), ('\ndowntime', DIM)),
+        Text.assemble((f'{v.pct:.3f}%' if v.monitored > 0 else '—', f'bold {colour}' if v.monitored > 0 else 'bold'),
+                      ('\nuptime', DIM)),
+        Text.assemble((format_span(v.down_s), f'bold {BAD}' if v.down_s else 'bold'), ('\ndowntime', DIM)),
         Text.assemble((f'{n:,}', f'bold {BAD}' if n else f'bold {OK}'), ('\ndrops', DIM)),
         Text.assemble((format_span(avg) if avg is not None else '—', f'bold {ACCENT}'), ('\navg drop', DIM)),
-        Text.assemble((f'{sum(a.lat) / len(a.lat):.0f} ms' if a.lat else '—', 'bold'), ('\navg latency', DIM)),
+        Text.assemble((f'{sum(v.lat) / len(v.lat):.0f} ms' if v.lat else '—', 'bold'), ('\navg latency', DIM)),
     )
-    sub = Text(f"{a.rows[0]['t']:%b %d %H:%M} → {a.rows[-1]['t']:%b %d %H:%M} · "
-               f"{format_span(a.monitored)} monitored", style=DIM)
-    return Panel(t, border_style=DIM, box=box.ROUNDED, padding=(0, 2), subtitle=sub, subtitle_align='right')
+    sub = Text(f"{v.first:%b %d %H:%M} → {v.last:%b %d %H:%M} · {format_span(v.monitored)} monitored", style=DIM)
+    return Panel(t, border_style=DIM, box=box.ROUNDED, padding=(0, 2), title=Text(f' {v.name} ', style='bold'),
+                 title_align='left', subtitle=sub, subtitle_align='right')
 
 
 def conn_lines(a):
     """One line per connection/network with its share of the time and drop count."""
-    width = max(len(n) for n in a.by_conn)
+    width = max(len(n) for n in a.by_tab)
     lines = []
-    for name in sorted(a.by_conn, key=lambda k: -(a.by_conn[k]['up'] + a.by_conn[k]['down'])):
-        c = a.by_conn[name]
+    for name in sorted(a.by_tab, key=lambda k: -(a.by_tab[k]['up'] + a.by_tab[k]['down'])):
+        c = a.by_tab[name]
         t = c['up'] + c['down']
         p = 100 * c['up'] / t if t > 0 else 0
-        n = sum(1 for o in a.outages if o['conn'] == name)
+        n = sum(1 for o in a.outages if o['tab'] == name)
         lines.append(Text.assemble(
             (f'  {name:<{width}}  ', 'bold'), (f'{p:6.2f}% up', OK if p >= 99.9 else WARN if p >= 99 else BAD),
             (f' · {format_span(t)} · {n} drop{"" if n == 1 else "s"}', DIM), no_wrap=True, overflow='ellipsis'))
     return lines
 
 
-def drop_line(o):
+def where(o):
+    """Short description of the connection a drop happened on."""
+    if o['tab'] == 'other':
+        return o['raw']  # e.g. no-link, which the tab name alone would hide
+    return o['tab'] + (' (modem)' if o['modem'] else '')
+
+
+def drop_line(o, show_conn=True, selected=False):
     colour = CAUSE_COLOUR.get(o['cause'], DIM)
     secs = o['secs']
     line = Text.assemble((' ✗ ', f'bold {colour}'), (f"{o['cause'].lower():<9}", colour),
                          (f"{o['start']:%m-%d %H:%M:%S}  ", DIM),
                          (f'{format_span(secs):<8}', BAD if secs >= 60 else WARN if secs >= 15 else ''),
-                         (o['conn'], DIM), no_wrap=True, overflow='ellipsis')
+                         (where(o) if show_conn else '', DIM), no_wrap=True, overflow='ellipsis')
     if o['ongoing']:
         line.append('  ongoing', style=f'bold {BAD}')
+    if selected:
+        line.stylize('on grey23')
     return line
 
 
@@ -635,7 +677,7 @@ def print_rich_report(args, since, recent=15):
         return
     console.print()
     console.print(Text.assemble((' ◆ ', ACCENT), ('internet connection report', 'bold')))
-    console.print(stat_cards(a))
+    console.print(stat_cards(scope_view(a, None)))
     for line in conn_lines(a):
         console.print(line)
     if a.outages:
@@ -778,28 +820,50 @@ class InputWatcher:
                         self.screen.scroll(key)
                 elif ch in 'qQ':
                     _thread.interrupt_main()  # same as Ctrl+C: stop monitoring cleanly
+                elif ch == '?':
+                    self.screen.toggle_legend()
         except Exception:
             pass  # can't read input: the dashboard still works, just without scrolling
 
 
+def tab_order(key):
+    rank = {'ethernet': 0, 'Wi-Fi (unknown)': 8, 'other': 9}.get(key, 1)
+    return rank, key.lower()
+
+
 class Dashboard:
-    """Full-screen view: live status and timelines, stat cards, and a scrollable, filterable list of drops."""
+    """Full-screen view: live status and timelines, then one set of tabs (a tab per connection) that
+    drives both the stat cards and the scrollable list of drops."""
+
+    BAR_X0 = 11  # first screen column (1-based) of the timeline squares: ' ' + 9-char label
+    NET_ROW, ROUTER_ROW = 3, 4  # screen rows (1-based) of the two timelines
 
     def __init__(self, monitor):
         self.m = monitor
-        self.filter = None        # None = all drops, else ('cause', X) or ('conn', label)
+        self.filter = None        # None = all connections, else a tab key
         self.manual_start = None  # first visible row once the user scrolls; None = follow the newest
-        self.legend_hits, self.legend_row = [], 0
+        self.show_legend = True
+        self.highlight = None     # start time of the drop picked by clicking the timeline
+        self.jump = None          # timestamp of a timeline click, resolved to a drop on the next render
+        self.tab_hits, self.tab_row = [], 0
+        self.bar_w, self.width = 10, 80
         self.last_start, self.last_avail, self.last_total = 0, 1, 0
 
+    # --- input
     def click(self, x, y):
-        if y != self.legend_row:
-            return
-        for x0, x1, key in self.legend_hits:
-            if x0 <= x <= x1:
-                self.filter = None if key == self.filter else key
-                self.manual_start = None
-                return
+        if y == self.tab_row:
+            for x0, x1, key in self.tab_hits:
+                if x0 <= x <= x1:
+                    self.filter = None if key == self.filter else key
+                    self.manual_start = self.highlight = self.jump = None
+                    return
+        elif y in (self.NET_ROW, self.ROUTER_ROW):
+            m, n = self.m, self.bar_w
+            cells = (m.hist_net if y == self.NET_ROW else m.hist_router)[-n:]
+            tabs, stamps = m.hist_tab[-n:], m.hist_ts[-n:]
+            i = x - self.BAR_X0
+            if 0 <= i < min(len(cells), len(tabs), len(stamps)) and not cells[i]:  # a red/yellow square
+                self.filter, self.jump, self.manual_start, self.highlight = tabs[i], stamps[i], None, None
 
     def scroll(self, key):
         if key == 'end':
@@ -811,13 +875,11 @@ class Dashboard:
         new = 0 if key == 'home' else base + step[key]
         self.manual_start = max(0, min(new, self.last_total - self.last_avail))
 
-    def visible(self, outages):
-        if self.filter is None:
-            return outages
-        kind, value = self.filter
-        return [o for o in outages if o['cause' if kind == 'cause' else 'conn'] == value]
+    def toggle_legend(self):
+        self.show_legend = not self.show_legend
 
-    def legend(self, a):
+    # --- pieces
+    def tabs(self, a):
         text = Text(no_wrap=True, overflow='ellipsis')
         hits = []
         text.append(' ')
@@ -834,15 +896,11 @@ class Dashboard:
             text.append(' ')
 
         item(None, 'all', 'grey85', len(a.outages))
-        for cause, icon, colour in (('UPSTREAM', '↑', WARN), ('LOCAL', '⌂', BAD)):
-            count = sum(1 for o in a.outages if o['cause'] == cause)
-            if count or self.filter == ('cause', cause):
-                item(('cause', cause), f'{icon} {cause.lower()}', colour, count)
-        if len(a.by_conn) > 1:
-            for name in sorted(a.by_conn):
-                item(('conn', name), name, ACCENT, sum(1 for o in a.outages if o['conn'] == name))
-        text.append('◂ click a tab to filter', style=DIM)
-        self.legend_hits = hits
+        if len(a.by_tab) > 1:  # with a single connection a tab would just repeat "all"
+            for key in sorted(a.by_tab, key=tab_order):
+                item(key, key, DIM if key == 'other' else ACCENT, sum(1 for o in a.outages if o['tab'] == key))
+            text.append('◂ click one to filter', style=DIM)
+        self.tab_hits = hits
         return text
 
     @staticmethod
@@ -858,6 +916,50 @@ class Dashboard:
             i = j
         return text
 
+    def legend_lines(self, a, rows):
+        """Explains only what is on screen: the causes and connections of the drops in `rows`, the colours
+        of squares actually showing in the timelines, and the tabs that are displayed."""
+        m, n = self.m, self.bar_w
+        causes = {o['cause'] for o in rows}
+        net_down = not all(m.hist_net[-n:])
+        router_down = bool(m.router_ip) and not all(m.hist_router[-n:])
+        tabs = set(a.by_tab) if len(a.by_tab) > 1 else set()
+        lines = []
+
+        by_cause = []
+        if 'UPSTREAM' in causes:
+            by_cause.append([('upstream', WARN), ("  router answered, the internet didn't → modem or provider", DIM)])
+        if 'LOCAL' in causes:
+            by_cause.append([('local', BAD), ("  router didn't answer → Wi-Fi, cable or router", DIM)])
+        if 'unknown' in causes:
+            by_cause.append([('unknown', DIM), ('  router status not known', DIM)])
+        if by_cause:
+            joined = [(' ', DIM)]
+            for k, entry in enumerate(by_cause):
+                joined += ([('     ', DIM)] if k else []) + entry
+            if sum(cell_len(t) for t, _ in joined) < self.width:
+                lines.append(joined)
+            else:  # too wide to share a line
+                lines.extend([(' ', DIM)] + entry for entry in by_cause)
+
+        entries = []  # the squares: only the colours that are actually showing need a key
+        if net_down:
+            entries += [(' ■', BAD), (' internet down', DIM)]
+        if router_down:
+            entries += [('   ■' if entries else ' ■', WARN), (' router down', DIM)]
+        if entries:
+            entries += [('      click a red/yellow ■ above to jump to that drop', DIM)]
+            lines.append(entries)
+
+        notes = []
+        if any(o['modem'] for o in rows):
+            notes.append('(modem) = plugged straight into a modem rather than a router (guessed from the IP)')
+        if 'Wi-Fi (unknown)' in tabs:
+            notes.append("Wi-Fi (unknown) = the network's name couldn't be read")
+        if notes:
+            lines.append([(' ' + ' · '.join(notes), DIM)])
+        return [Text.assemble(*e, no_wrap=True, overflow='ellipsis') for e in lines]
+
     def __rich_console__(self, console, options):
         m = self.m
         a = m.stats
@@ -865,7 +967,8 @@ class Dashboard:
         height = options.height or console.size.height
         now = datetime.now()
 
-        bar_w = max(10, width - 14)
+        self.width = width
+        self.bar_w = bar_w = max(10, width - 14)
         router = f'router {m.router_ip}' if m.router_ip else 'no router found'
         head = [Text.assemble((' ◆ ', ACCENT), ('internet monitor', 'bold'),
                               (f'  · {label(m.conn, m.network)} · {router}'
@@ -883,43 +986,59 @@ class Dashboard:
                                       (f'   since {m.state_since:%H:%M:%S}', DIM), no_wrap=True))
         head.append(self.bar('Internet', m.hist_net, bar_w, BAD))
         head.append(self.bar('Router', m.hist_router, bar_w, WARN) if m.router_ip else Text(''))
-
-        extra = []
-        if a is None:
-            extra.append(Text(f' {m.stats_msg}', style=DIM))
-            cards_rows = conn_rows = 0
-        else:
-            extra.append(stat_cards(a))
-            cards_rows = 4  # border, two lines of numbers/labels, border
-            conns = conn_lines(a)[:4] if len(a.by_conn) > 1 else []
-            extra.extend(conns)
-            conn_rows = len(conns)
         yield from head
-        yield from extra
+
         if a is None:
+            yield Text(f' {m.stats_msg}', style=DIM)
             return
+        if self.filter is not None and self.filter not in a.by_tab:
+            self.filter = None  # that connection has no data in this period
+        yield stat_cards(scope_view(a, self.filter))  # border, two lines of numbers/labels, border: 4 rows
 
-        self.legend_row = len(head) + cards_rows + conn_rows + 1  # 1-based screen row of the tab strip
-        yield self.legend(a)
+        self.tab_row = len(head) + 4 + 1  # 1-based screen row of the tab strip
+        yield self.tabs(a)
 
-        vis = self.visible(a.outages)
+        vis = a.outages if self.filter is None else [o for o in a.outages if o['tab'] == self.filter]
         n = len(vis)
-        avail = max(1, height - self.legend_row - 1)  # minus the legend itself and the rule below the list
+        show_legend = self.show_legend and height >= 22
+        # Reserve room for the most the legend could say about this tab, so the list doesn't jump while scrolling.
+        reserve = len(self.legend_lines(a, vis)) if show_legend else 0
+        avail = max(1, height - self.tab_row - 1 - reserve - 1)  # minus list header, legend and the rule
+        if self.jump is not None:  # a timeline click: bring that drop into view and highlight it
+            for i, o in enumerate(vis):
+                slack = timedelta(seconds=m.a.interval)
+                if o['start'] - slack <= self.jump <= o['end'] + slack:
+                    self.highlight = o['start']
+                    self.manual_start = max(0, min(i - avail // 2, n - avail))
+                    self.jump = None
+                    break
+            else:
+                if (now - self.jump).total_seconds() > 120:
+                    self.jump = None  # never turned into a drop; give up
         start = max(0, n - avail)
         if self.manual_start is not None:
             start = max(0, min(self.manual_start, n - avail))
         self.last_start, self.last_avail, self.last_total = start, avail, n
         window = vis[start:start + avail]
+        legend = self.legend_lines(a, window) if show_legend else []
+
+        show_conn = self.filter in (None, 'other')  # elsewhere the tab already says it
+        yield Text(f"   {'cause':<9}{'when':<16}{'length':<8}{'connection' if show_conn else ''}", style=DIM,
+                   no_wrap=True)
         for o in window:
-            yield drop_line(o)
+            yield drop_line(o, show_conn, selected=o['start'] == self.highlight)
         if not n:
-            yield Text('  ✓ no drops in this period' if self.filter is None else '  no drops match this filter',
+            yield Text('  ✓ no drops in this period' if self.filter is None else '  no drops on this connection',
                        style=OK if self.filter is None else DIM)
         for _ in range(avail - len(window) - (0 if n else 1)):
             yield Text('')
+        for _ in range(reserve - len(legend)):
+            yield Text('')  # the legend has less to say about what's showing right now
+        yield from legend
 
         left = f'drops {start + 1 if n else 0}–{start + len(window)} of {n}'
-        right = ('End to follow' if self.manual_start is not None else 'wheel/↑↓ scroll') + ' · q quits'
+        right = (('End to follow' if self.manual_start is not None else 'wheel/↑↓ scroll')
+                 + ' · ? legend · q quits')
         fill = width - cell_len(left) - cell_len(right) - 4
         if fill >= 3:
             line = '─' * (fill + 1)
@@ -941,6 +1060,7 @@ class Monitor:
         except Exception:
             self.bar_width = 60
         self.hist_net, self.hist_router = [], []
+        self.hist_tab, self.hist_ts = [], []  # per check: which tab it belongs to, and when (for timeline clicks)
         self.prev = None
         self.state_since = self.last_check = datetime.now()
         self.last_ms = 0
@@ -1067,6 +1187,8 @@ class Monitor:
 
                 self.hist_net = (self.hist_net + [up])[-self.HIST:]
                 self.hist_router = (self.hist_router + [router != 'DOWN'])[-self.HIST:]
+                self.hist_tab = (self.hist_tab + [tab_key(self.conn, self.network)])[-self.HIST:]
+                self.hist_ts = (self.hist_ts + [now])[-self.HIST:]
 
                 # Re-read the log for the stats on a log row or every 30s; the rich view repaints by itself.
                 if self.rich:
