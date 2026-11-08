@@ -1254,7 +1254,20 @@ def self_update(args):
     if (here / '.git').exists():
         return  # a development checkout: never overwrite it
     try:
-        sha = latest_commit()
+        # A socket timeout doesn't cover a DNS lookup that hangs when there's no internet, so the first request
+        # runs in a thread we only wait a few seconds for: being offline must not hold up start-up.
+        found = []
+
+        def check():
+            try:
+                found.append(latest_commit())
+            except Exception:
+                pass
+
+        checker = threading.Thread(target=check, daemon=True)
+        checker.start()
+        checker.join(5)
+        sha = found[0] if found and not checker.is_alive() else None
         marker = here / '.version'  # the commit this copy was last brought up to date with
         if not sha or (marker.exists() and marker.read_text().strip() == sha):
             return
