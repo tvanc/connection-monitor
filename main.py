@@ -163,26 +163,42 @@ def parse_route_linux(text):
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
-def parse_route_windows(text):
-    best = None
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0] == '0.0.0.0' and parts[1] == '0.0.0.0':
-            try:
-                cand = (int(parts[4]), parts[2], parts[3])
-            except ValueError:
-                continue
-            best = min(best, cand) if best else cand
-    return (best[1], best[2]) if best else (None, None)  # (gateway, local ip)
+# Windows keeps default routes for adapters that are unplugged or disconnected, so `route print` can name an
+# adapter that isn't actually in use. Ask PowerShell for the best default route over an adapter that is Up.
+_WIN_ROUTE_SCRIPT = (
+    "$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | ForEach-Object { "
+    "$a = Get-NetAdapter -InterfaceIndex $_.ifIndex -ErrorAction SilentlyContinue; "
+    "if ($a -and $a.Status -eq 'Up') { [pscustomobject]@{ Hop = $_.NextHop; Idx = $a.ifIndex; "
+    "Media = $a.PhysicalMediaType; Metric = $_.RouteMetric + $_.InterfaceMetric } } } "
+    "| Sort-Object Metric | Select-Object -First 1; "
+    "if ($r) { $ip = (Get-NetIPAddress -InterfaceIndex $r.Idx -AddressFamily IPv4 -ErrorAction SilentlyContinue "
+    "| Select-Object -First 1).IPAddress; "
+    "$p = (Get-NetConnectionProfile -InterfaceIndex $r.Idx -ErrorAction SilentlyContinue | Select-Object -First 1).Name; "
+    "'{0}|{1}|{2}|{3}' -f $r.Hop, $ip, $r.Media, $p }"
+)
+
+
+def windows_active_route():
+    """(gateway, local ip, 'wifi'/'ethernet'/'other', network profile name) of the default route in use, or
+    None if there isn't one. For Wi-Fi the profile name is normally the network's name (SSID)."""
+    out = run(['powershell', '-NoProfile', '-NonInteractive', '-Command', _WIN_ROUTE_SCRIPT], timeout=20).strip()
+    parts = out.splitlines()[-1].split('|') if out else []
+    if len(parts) != 4 or not parts[0]:
+        return None
+    gateway, ip, media, profile = parts
+    return (gateway, ip or None, 'wifi' if '802.11' in media else 'ethernet' if '802.3' in media else 'other',
+            profile or None)
 
 
 def default_route():
-    """(gateway ip, interface name or local ip on Windows) of the default route, or (None, None)."""
+    """(gateway ip, interface name) of the default route, or (None, None). On Windows the second item is
+    the local IP address instead of a name."""
     if SYSTEM == 'Darwin':
         return parse_route_darwin(run(['route', '-n', 'get', 'default']))
     if SYSTEM == 'Linux':
         return parse_route_linux(run(['ip', '-4', 'route', 'show', 'default']))
-    return parse_route_windows(run(['route', 'print', '-4', '0.0.0.0']))
+    info = windows_active_route()
+    return (info[0], info[1]) if info else (None, None)
 
 
 def parse_hardware_ports(text):
@@ -202,7 +218,7 @@ def interface_ip(iface):
     if SYSTEM == 'Linux':
         m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', run(['ip', '-4', '-o', 'addr', 'show', 'dev', iface]))
         return m.group(1) if m else None
-    return iface  # on Windows default_route() already returns the local IP
+    return None
 
 
 def interface_media(iface):
@@ -215,7 +231,7 @@ def interface_media(iface):
         return 'other'
     if SYSTEM == 'Linux':
         return 'wifi' if Path(f'/sys/class/net/{iface}/wireless').exists() else 'ethernet'
-    return 'wifi' if re.search(r'State\s*:\s*connected', run(['netsh', 'wlan', 'show', 'interfaces'])) else 'ethernet'
+    return 'other'
 
 
 def clean_ssid(name):
@@ -310,13 +326,22 @@ def connection():
     The network is the Wi-Fi name ('unknown' if it can't be read) and blank when not on Wi-Fi.
     """
     try:
-        gw, iface = default_route()
-        if not gw or not iface:
-            return 'no-link', ''
-        ip = interface_ip(iface)
+        if SYSTEM == 'Windows':
+            info = windows_active_route()
+            if not info:
+                return 'no-link', ''
+            gw, ip, media, profile = info
+            iface = None
+        else:
+            gw, iface = default_route()
+            if not gw or not iface:
+                return 'no-link', ''
+            ip, media = interface_ip(iface), interface_media(iface)
         via = 'router' if not ip or not ipaddress.ip_address(ip).is_global else 'modem'
-        media = interface_media(iface)
-        return f'{via}-{media}', (wifi_ssid(iface) or 'unknown') if media == 'wifi' else ''
+        if media != 'wifi':
+            return f'{via}-{media}', ''
+        # Windows can hide the SSID from netsh (it needs Location access); the connection profile name is the fallback.
+        return f'{via}-{media}', wifi_ssid(iface) or (profile if SYSTEM == 'Windows' else None) or 'unknown'
     except Exception:
         return 'unknown', ''
 
